@@ -12,7 +12,7 @@ A GitHub Actions workflow that downloads a selected Arknights Android client, ex
 
 ### Bilibili client
 
-The Bilibili client is not available in this GitHub Actions workflow. To download it manually, visit the [Arknights listing on Bilibili Game Center](https://app.biligame.com/detail?id=101772) and download the APK from that page.
+The Bilibili client is not available in this GitHub Actions workflow. To download it manually, visit the [Arknights on Bilibili Game Center](https://app.biligame.com/detail?id=101772) and download the APK from that page.
 
 ## How to run the workflow
 
