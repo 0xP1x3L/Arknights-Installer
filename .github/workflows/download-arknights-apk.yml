@@ -1,0 +1,311 @@
+name: Download Arknights APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      client:
+        description: Arknights client to download
+        required: true
+        type: choice
+        default: Official
+        options:
+          - Official
+          - Bilibili
+          - YoStarEN
+          - YoStarJP
+          - YoStarKR
+          - txwy
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-package:
+    name: Download, Merge, Align, Sign, and Package Arknights
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      JAVA_TOOL_OPTIONS: -Xmx6g -XX:+UseParallelGC -XX:TieredStopAtLevel=1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: platform-tools
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "build-tools;36.0.0"
+
+      - name: Resolve selected client
+        shell: bash
+        env:
+          SELECTED_CLIENT: ${{ inputs.client }}
+        run: |
+          set -euo pipefail
+          case "$SELECTED_CLIENT" in
+            Official) PACKAGE_ID='com.hypergryph.arknights' ;;
+            Bilibili) PACKAGE_ID='com.hypergryph.arknights.bilibili' ;;
+            YoStarEN) PACKAGE_ID='com.YoStarEN.Arknights' ;;
+            YoStarJP) PACKAGE_ID='com.YoStarJP.Arknights' ;;
+            YoStarKR) PACKAGE_ID='com.YoStarKR.Arknights' ;;
+            txwy) PACKAGE_ID='tw.txwy.and.arknights' ;;
+            *) echo "Unsupported client: $SELECTED_CLIENT" >&2; exit 1 ;;
+          esac
+          echo "CLIENT_LABEL=$SELECTED_CLIENT" >> "$GITHUB_ENV"
+          echo "CLIENT_PACKAGE_ID=$PACKAGE_ID" >> "$GITHUB_ENV"
+          echo "Selected client: $SELECTED_CLIENT"
+          echo "Expected package ID: $PACKAGE_ID"
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK_DIR="$RUNNER_TEMP/arknights-work"
+          DOWNLOAD_DIR="$WORK_DIR/download"
+          APK_DIR="$WORK_DIR/package-apks"
+          TOOLS_DIR="$WORK_DIR/tools"
+          DIST_DIR="$GITHUB_WORKSPACE/dist"
+          rm -rf "$WORK_DIR" "$DIST_DIR"
+          mkdir -p "$DOWNLOAD_DIR" "$APK_DIR" "$TOOLS_DIR" "$DIST_DIR"
+          printf 'WORK_DIR=%s\n' "$WORK_DIR" >> "$GITHUB_ENV"
+          printf 'DOWNLOAD_DIR=%s\n' "$DOWNLOAD_DIR" >> "$GITHUB_ENV"
+          printf 'APK_DIR=%s\n' "$APK_DIR" >> "$GITHUB_ENV"
+          printf 'TOOLS_DIR=%s\n' "$TOOLS_DIR" >> "$GITHUB_ENV"
+          printf 'DIST_DIR=%s\n' "$DIST_DIR" >> "$GITHUB_ENV"
+
+      - name: Download Android package tools and APKToolGUI engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 \
+            'https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu' \
+            --output "$TOOLS_DIR/apkeep"
+          chmod +x "$TOOLS_DIR/apkeep"
+          APKTOOLGUI_SIGNING_TAG='v3.4.0.0'
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://api.github.com/repos/AndnixSH/APKToolGUI/releases/tags/$APKTOOLGUI_SIGNING_TAG" \
+            --output "$TOOLS_DIR/apktoolgui-release.json"
+          APKTOOLGUI_URL="$(python3 - "$TOOLS_DIR/apktoolgui-release.json" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              release = json.load(stream)
+          assets = [asset for asset in release.get('assets', [])
+                    if asset.get('name', '').lower().startswith('apk.tool.gui.')
+                    and asset.get('name', '').lower().endswith('.zip')]
+          if not assets:
+              raise SystemExit('Could not find the APKToolGUI release ZIP asset.')
+          print(assets[0]['browser_download_url'])
+          PY
+          )"
+          curl --fail --silent --show-error --location --retry 3 \
+            "$APKTOOLGUI_URL" --output "$TOOLS_DIR/apktoolgui-release.zip"
+          mkdir -p "$TOOLS_DIR/apktoolgui"
+          unzip -q "$TOOLS_DIR/apktoolgui-release.zip" -d "$TOOLS_DIR/apktoolgui"
+          BUNDLED_APKEDITOR_JAR="$(find "$TOOLS_DIR/apktoolgui" -type f -iname 'APKEditor.jar' -print -quit)"
+          if [[ -z "$BUNDLED_APKEDITOR_JAR" || ! -s "$BUNDLED_APKEDITOR_JAR" ]]; then
+            echo 'APKEditor.jar was not found in the APKToolGUI release ZIP.' >&2
+            exit 1
+          fi
+          APKEDITOR_JAR="$TOOLS_DIR/APKEditor.jar"
+          cp "$BUNDLED_APKEDITOR_JAR" "$APKEDITOR_JAR"
+          rm -rf "$TOOLS_DIR/apktoolgui" "$TOOLS_DIR/apktoolgui-release.zip" "$TOOLS_DIR/apktoolgui-release.json"
+          SIGNING_DIR="$TOOLS_DIR/apktoolgui-signing"
+          mkdir -p "$SIGNING_DIR"
+          APKTOOLGUI_TESTKEY_PK8="$SIGNING_DIR/testkey.pk8"
+          APKTOOLGUI_TESTKEY_CERT="$SIGNING_DIR/testkey.x509.pem"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://raw.githubusercontent.com/AndnixSH/APKToolGUI/$APKTOOLGUI_SIGNING_TAG/Tools/testkey.pk8" \
+            --output "$APKTOOLGUI_TESTKEY_PK8"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://raw.githubusercontent.com/AndnixSH/APKToolGUI/$APKTOOLGUI_SIGNING_TAG/Tools/testkey.x509.pem" \
+            --output "$APKTOOLGUI_TESTKEY_CERT"
+          test -s "$APKTOOLGUI_TESTKEY_PK8"
+          test -s "$APKTOOLGUI_TESTKEY_CERT"
+          printf 'APKEDITOR_JAR=%s\n' "$APKEDITOR_JAR" >> "$GITHUB_ENV"
+          printf 'APKTOOLGUI_TESTKEY_PK8=%s\n' "$APKTOOLGUI_TESTKEY_PK8" >> "$GITHUB_ENV"
+          printf 'APKTOOLGUI_TESTKEY_CERT=%s\n' "$APKTOOLGUI_TESTKEY_CERT" >> "$GITHUB_ENV"
+          echo "APKEditor engine: $APKEDITOR_JAR"
+          openssl x509 -in "$APKTOOLGUI_TESTKEY_CERT" -noout -fingerprint -sha256
+
+      - name: Download selected game package
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Downloading $CLIENT_PACKAGE_ID from APKPure through apkeep."
+          "$TOOLS_DIR/apkeep" -a "$CLIENT_PACKAGE_ID" -d apk-pure -o 'acknowledge_dangers=true' "$DOWNLOAD_DIR"
+          find "$DOWNLOAD_DIR" -type f -printf '%p (%s bytes)\n' | sort
+          rm -f "$TOOLS_DIR/apkeep"
+          if ! find "$DOWNLOAD_DIR" -type f -print -quit | grep -q .; then
+            echo "No files were downloaded for package $CLIENT_PACKAGE_ID." >&2
+            exit 1
+          fi
+
+      - name: Extract APK files and preserve OBB files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          download_dir = Path(os.environ['DOWNLOAD_DIR'])
+          apk_dir = Path(os.environ['APK_DIR'])
+          dist_dir = Path(os.environ['DIST_DIR'])
+          package_id = os.environ['CLIENT_PACKAGE_ID']
+          archive_suffixes = {'.xapk', '.apks', '.apkm'}
+          archives = sorted(path for path in download_dir.rglob('*')
+                            if path.is_file() and path.suffix.lower() in archive_suffixes)
+          if len(archives) > 1:
+              raise SystemExit('More than one package archive was downloaded; refusing to merge unrelated packages.')
+
+          def copy_stream(source, destination):
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              with source as input_stream, destination.open('wb') as output_stream:
+                  shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+
+          def unique_destination(directory, name, used):
+              name = PurePosixPath(name).name
+              if not name:
+                  raise SystemExit('A package entry had an empty filename.')
+              candidate = name
+              stem = Path(name).stem
+              suffix = Path(name).suffix
+              index = 2
+              while candidate.casefold() in used:
+                  candidate = f'{stem}_{index}{suffix}'
+                  index += 1
+              used.add(candidate.casefold())
+              return directory / candidate
+
+          used_apks = set()
+          used_obbs = set()
+          apk_count = 0
+          obb_count = 0
+          obb_dir = dist_dir / 'Android' / 'obb' / package_id
+          if archives:
+              archive_path = archives[0]
+              if not zipfile.is_zipfile(archive_path):
+                  raise SystemExit(f'Package archive is not a readable ZIP file: {archive_path.name}')
+              with zipfile.ZipFile(archive_path) as archive:
+                  members = [entry for entry in archive.infolist() if not entry.is_dir()]
+                  manifest_entry = next((entry for entry in members
+                                          if PurePosixPath(entry.filename).name.casefold() == 'manifest.json'), None)
+                  if manifest_entry:
+                      try:
+                          manifest = json.loads(archive.read(manifest_entry).decode('utf-8-sig'))
+                          actual_package = str(manifest.get('package_name') or manifest.get('packageName') or '')
+                          version = str(manifest.get('version_name') or manifest.get('versionName') or 'unknown')
+                          if actual_package and actual_package != package_id:
+                              raise SystemExit(f'Archive package ID mismatch: expected {package_id}, got {actual_package}.')
+                          print(f'PACKAGE_METADATA package={actual_package or package_id} version={version}')
+                      except (ValueError, UnicodeDecodeError) as error:
+                          raise SystemExit(f'Could not read package manifest: {error}')
+                  apk_entries = [entry for entry in members if PurePosixPath(entry.filename).suffix.casefold() == '.apk']
+                  if not apk_entries:
+                      raise SystemExit('The downloaded archive contains no APK files.')
+                  for entry in apk_entries:
+                      destination = unique_destination(apk_dir, entry.filename, used_apks)
+                      copy_stream(archive.open(entry), destination)
+                      apk_count += 1
+                      print(f'EXTRACTED_APK source={entry.filename} output={destination.name} bytes={entry.file_size}')
+                  for entry in members:
+                      if PurePosixPath(entry.filename).suffix.casefold() == '.obb':
+                          destination = unique_destination(obb_dir, entry.filename, used_obbs)
+                          copy_stream(archive.open(entry), destination)
+                          obb_count += 1
+                          print(f'PRESERVED_OBB source={entry.filename} output={destination.relative_to(dist_dir)} bytes={entry.file_size}')
+          else:
+              loose_apks = sorted(path for path in download_dir.rglob('*')
+                                  if path.is_file() and path.suffix.casefold() == '.apk')
+              if not loose_apks:
+                  raise SystemExit('No APK, XAPK, APKS, or APKM package was downloaded for the selected client.')
+              for source in loose_apks:
+                  destination = unique_destination(apk_dir, source.name, used_apks)
+                  shutil.copy2(source, destination)
+                  apk_count += 1
+                  print(f'COPIED_APK source={source.name} output={destination.name} bytes={source.stat().st_size}')
+
+          for source in sorted(path for path in download_dir.rglob('*')
+                               if path.is_file() and path.suffix.casefold() == '.obb'):
+              if archives and source == archives[0]:
+                  continue
+              if obb_dir.exists():
+                  used_obbs.update(path.name.casefold() for path in obb_dir.iterdir() if path.is_file())
+              destination = unique_destination(obb_dir, source.name, used_obbs)
+              shutil.copy2(source, destination)
+              obb_count += 1
+              print(f'PRESERVED_OBB source={source.name} output={destination.relative_to(dist_dir)} bytes={source.stat().st_size}')
+
+          if apk_count < 1:
+              raise SystemExit('No APK files were extracted.')
+          needs_merge = bool(archives) or apk_count > 1
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as environment:
+              environment.write(f'PACKAGE_NEEDS_MERGE={str(needs_merge).lower()}\n')
+          print(f'PACKAGE_SUMMARY package={package_id} apk_count={apk_count} obb_count={obb_count} needs_merge={str(needs_merge).lower()}')
+          PY
+          rm -rf "$DOWNLOAD_DIR"
+
+      - name: Merge APK splits, align, and sign with APKToolGUI test key
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          MERGED="$WORK_DIR/merged.apk"
+          ALIGNED="$WORK_DIR/aligned.apk"
+          FINAL_APK="$DIST_DIR/Arknights-${CLIENT_LABEL}.apk"
+          mapfile -t SOURCE_APKS < <(find "$APK_DIR" -maxdepth 1 -type f -iname '*.apk' -print | sort)
+          if [[ "${#SOURCE_APKS[@]}" -eq 0 ]]; then
+            echo 'No APK files are available for packaging.' >&2
+            exit 1
+          elif [[ "$PACKAGE_NEEDS_MERGE" == 'true' || "${#SOURCE_APKS[@]}" -gt 1 ]]; then
+            java -jar "$APKEDITOR_JAR" m -i "$APK_DIR" -o "$MERGED"
+          else
+            cp "${SOURCE_APKS[0]}" "$MERGED"
+          fi
+          test -s "$MERGED"
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$MERGED" "$ALIGNED"
+          test -s "$ALIGNED"
+          "$BUILD_TOOLS/zipalign" -c -P 4 -v 4 "$ALIGNED"
+          "$BUILD_TOOLS/apksigner" sign \
+            --key "$APKTOOLGUI_TESTKEY_PK8" \
+            --cert "$APKTOOLGUI_TESTKEY_CERT" \
+            --out "$FINAL_APK" \
+            "$ALIGNED"
+          test -s "$FINAL_APK"
+          "$BUILD_TOOLS/apksigner" verify --verbose "$FINAL_APK"
+          ACTUAL_PACKAGE="$("$BUILD_TOOLS/aapt" dump badging "$FINAL_APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+          if [[ "$ACTUAL_PACKAGE" != "$CLIENT_PACKAGE_ID" ]]; then
+            echo "Final APK package mismatch: expected $CLIENT_PACKAGE_ID, got ${ACTUAL_PACKAGE:-unknown}." >&2
+            exit 1
+          fi
+          echo "Verified package ID: $ACTUAL_PACKAGE"
+          rm -f "$MERGED" "$ALIGNED" "$APKEDITOR_JAR" "$APKTOOLGUI_TESTKEY_PK8" "$APKTOOLGUI_TESTKEY_CERT"
+          rm -rf "$APK_DIR" "$DOWNLOAD_DIR" "$TOOLS_DIR"
+          find "$DIST_DIR" -type f -printf '%p (%s bytes)\n' | sort
+
+      - name: Upload APK and OBB files
+        uses: actions/upload-artifact@v7
+        with:
+          name: Arknights-${{ inputs.client }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
