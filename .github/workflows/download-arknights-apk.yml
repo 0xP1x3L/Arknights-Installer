@@ -146,8 +146,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Downloading $CLIENT_PACKAGE_ID from APKPure through apkeep."
-          "$TOOLS_DIR/apkeep" -a "$CLIENT_PACKAGE_ID" -d apk-pure -o 'acknowledge_dangers=true' "$DOWNLOAD_DIR"
+          if [[ "$CLIENT_PACKAGE_ID" == "com.hypergryph.arknights.bilibili" ]]; then
+            echo "Downloading Bilibili client from Hypergryph's direct download endpoint."
+            BILIBILI_APK_URL='https://launcher.hypergryph.com/game/latest/GzD1CpaWgmSq1wew/2/2'
+            curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+              "$BILIBILI_APK_URL" --output "$DOWNLOAD_DIR/arknights-bilibili.apk"
+            if ! file "$DOWNLOAD_DIR/arknights-bilibili.apk" | grep -qiE 'zip archive|android package'; then
+              echo "The direct Bilibili download does not appear to be a valid APK archive." >&2
+              file "$DOWNLOAD_DIR/arknights-bilibili.apk" >&2 || true
+              exit 1
+            fi
+          else
+            echo "Downloading $CLIENT_PACKAGE_ID from APKPure through apkeep."
+            "$TOOLS_DIR/apkeep" -a "$CLIENT_PACKAGE_ID" -d apk-pure -o 'acknowledge_dangers=true' "$DOWNLOAD_DIR"
+          fi
           find "$DOWNLOAD_DIR" -type f -printf '%p (%s bytes)\n' | sort
           rm -f "$TOOLS_DIR/apkeep"
           if ! find "$DOWNLOAD_DIR" -type f -print -quit | grep -q .; then
